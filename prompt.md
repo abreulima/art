@@ -1,16 +1,1 @@
-
-O mapa esta localizado em: map.png
-
-As imagens dos jogadores estao localizadas em:
-players/antonio.png
-players/diogo.png
-players/kiene.png
-players/luisa.png
-players/miguel.png
-players/mp.png
-players/nicolau.png
-players/rodrigo.png
-players/rodrigues.png
-players/samuel.png
-players/santos.png
-players/tavares.png
+Crie um cliente em Python usando Raylib (pyray) que se conecta a um servidor TCP em 127.0.0.1:5050. O cliente deve: * Enviar continuamente JSON com: {"type":"update","name":"player","image":"players/player.png","x":X,"y":Y} * Receber JSON do servidor com: {"type":"world","map":"map.png","players":[...]} * Carregar e desenhar: * map.png como fundo * todos os jogadores nas posições recebidas * Usar W, A, S, D para mover o jogador * Usar uma thread para receber dados sem travar o jogo Gere o código completo e funcional.
