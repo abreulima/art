@@ -29,23 +29,22 @@ MAX_HP = 100
 UPDATE_INTERVAL = 1.0 / 30.0
 SOCKET_TIMEOUT = 0.25
 
-# Pode trocar a tecla de tiro se quiser.
-# Aqui: seta para direção do tiro, ou mouse para mirar + clique esquerdo.
 USE_MOUSE_AIM = True
+
+# fallback se o mapa nao existir
+FALLBACK_MAP_WIDTH = 2000
+FALLBACK_MAP_HEIGHT = 2000
 
 # ============================================================
 # ESTADO GLOBAL
 # ============================================================
 
 running = True
-
 world_lock = threading.Lock()
 
-# Estado recebido do servidor
-remote_players = {}      # name -> dict
-remote_projectiles = []  # lista de projéteis
+remote_players = {}
+remote_projectiles = []
 
-# Estado local
 local_player = {
     "name": PLAYER_NAME,
     "image": PLAYER_IMAGE,
@@ -58,14 +57,15 @@ local_player = {
     "h": 32,
 }
 
-# Cache de texturas por caminho
 texture_cache = {}
-
-# Controle de tiro local
 last_shot_time = 0.0
-
-# UDP
 sock = None
+
+map_texture = None
+map_width = FALLBACK_MAP_WIDTH
+map_height = FALLBACK_MAP_HEIGHT
+
+camera = None
 
 # ============================================================
 # UDP / THREAD DE RECEBIMENTO
@@ -138,7 +138,6 @@ def receiver_loop():
                 remote_players = new_players
                 remote_projectiles = new_projectiles
 
-                # Se o servidor enviar o próprio player, sincroniza HP/posição.
                 if PLAYER_NAME in remote_players:
                     server_me = remote_players[PLAYER_NAME]
                     local_player["hp"] = int(server_me.get("hp", local_player["hp"]))
@@ -174,7 +173,7 @@ def unload_all_textures():
     texture_cache.clear()
 
 # ============================================================
-# LÓGICA
+# UTIL
 # ============================================================
 
 def normalize(x, y):
@@ -182,6 +181,42 @@ def normalize(x, y):
     if length <= 0.00001:
         return 0.0, 0.0
     return x / length, y / length
+
+def clamp(v, min_v, max_v):
+    return max(min_v, min(v, max_v))
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+def init_camera():
+    global camera
+    camera = pr.Camera2D()
+    camera.target = pr.Vector2(local_player["x"], local_player["y"])
+    camera.offset = pr.Vector2(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
+    camera.rotation = 0.0
+    camera.zoom = 1.0
+
+def update_camera():
+    camera.target = pr.Vector2(local_player["x"], local_player["y"])
+
+    half_w = SCREEN_WIDTH / 2 / camera.zoom
+    half_h = SCREEN_HEIGHT / 2 / camera.zoom
+
+    min_x = half_w
+    max_x = max(half_w, map_width - half_w)
+
+    min_y = half_h
+    max_y = max(half_h, map_height - half_h)
+
+    target_x = clamp(local_player["x"], min_x, max_x)
+    target_y = clamp(local_player["y"], min_y, max_y)
+
+    camera.target = pr.Vector2(target_x, target_y)
+
+# ============================================================
+# LOGICA
+# ============================================================
 
 def handle_input(dt):
     global last_shot_time
@@ -203,6 +238,9 @@ def handle_input(dt):
     local_player["x"] += move_x * MOVE_SPEED * dt
     local_player["y"] += move_y * MOVE_SPEED * dt
 
+    local_player["x"] = clamp(local_player["x"], 0, map_width)
+    local_player["y"] = clamp(local_player["y"], 0, map_height)
+
     if move_x != 0.0 or move_y != 0.0:
         local_player["dir_x"] = move_x
         local_player["dir_y"] = move_y
@@ -210,9 +248,11 @@ def handle_input(dt):
     shoot_dx, shoot_dy = 0.0, 0.0
 
     if USE_MOUSE_AIM:
-        mouse = pr.get_mouse_position()
-        shoot_dx = mouse.x - local_player["x"]
-        shoot_dy = mouse.y - local_player["y"]
+        mouse_screen = pr.get_mouse_position()
+        mouse_world = pr.get_screen_to_world_2d(mouse_screen, camera)
+
+        shoot_dx = mouse_world.x - local_player["x"]
+        shoot_dy = mouse_world.y - local_player["y"]
         shoot_dx, shoot_dy = normalize(shoot_dx, shoot_dy)
 
         if shoot_dx != 0.0 or shoot_dy != 0.0:
@@ -255,6 +295,7 @@ def handle_input(dt):
             "radius": 5,
             "damage": 10,
         })
+
         last_shot_time = now
 
 def send_update():
@@ -313,8 +354,8 @@ def draw_projectile(projectile):
 
 def draw_fallback_map():
     tile = 64
-    for y in range(0, SCREEN_HEIGHT, tile):
-        for x in range(0, SCREEN_WIDTH, tile):
+    for y in range(0, map_height, tile):
+        for x in range(0, map_width, tile):
             c = pr.DARKGREEN if ((x // tile) + (y // tile)) % 2 == 0 else pr.GREEN
             pr.draw_rectangle(x, y, tile, tile, c)
 
@@ -323,7 +364,7 @@ def draw_fallback_map():
 # ============================================================
 
 def main():
-    global sock, running
+    global sock, running, map_texture, map_width, map_height
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(SOCKET_TIMEOUT)
@@ -334,18 +375,21 @@ def main():
     pr.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, WINDOW_TITLE)
     pr.set_target_fps(60)
 
-    # Carrega o mapa UMA única vez
     map_texture = get_texture(MAP_IMAGE)
+    if map_texture is not None:
+        map_width = map_texture.width
+        map_height = map_texture.height
 
-    # Envia presença inicial
+    init_camera()
+
     send_update()
-
     last_update_sent = 0.0
 
     while not pr.window_should_close():
         dt = pr.get_frame_time()
 
         handle_input(dt)
+        update_camera()
 
         now = time.time()
         if (now - last_update_sent) >= UPDATE_INTERVAL:
@@ -359,24 +403,34 @@ def main():
         pr.begin_drawing()
         pr.clear_background(pr.BLACK)
 
-        # Fundo / mapa
+        pr.begin_mode_2d(camera)
+
+        # mapa
         if map_texture is not None:
             pr.draw_texture(map_texture, 0, 0, pr.WHITE)
         else:
             draw_fallback_map()
 
-        # Jogadores remotos
+        # players remotos
         for name, player in players_snapshot.items():
             if name == PLAYER_NAME:
                 continue
             draw_player(player, is_local=False)
 
-        # Projetéis
+        # projeteis
         for projectile in projectiles_snapshot:
             draw_projectile(projectile)
 
-        # Jogador local por cima
+        # player local
         draw_player(local_player, is_local=True)
+
+        # mira
+        if USE_MOUSE_AIM:
+            mouse_screen = pr.get_mouse_position()
+            mouse_world = pr.get_screen_to_world_2d(mouse_screen, camera)
+            pr.draw_circle_lines(int(mouse_world.x), int(mouse_world.y), 8, pr.YELLOW)
+
+        pr.end_mode_2d()
 
         # HUD
         hud = f"HP: {local_player['hp']}   X: {int(local_player['x'])}   Y: {int(local_player['y'])}"
