@@ -18,8 +18,9 @@ SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 WINDOW_TITLE = "PvP UDP Client - pyray"
 
-PLAYER_NAME = "player"
-PLAYER_IMAGE = "players/player.png"
+# IMPORTANTE: cada cliente deve ter um nome diferente
+PLAYER_NAME = "TEU_NOME"
+PLAYER_IMAGE = "players/luisa.png"
 MAP_IMAGE = "map.png"
 
 MOVE_SPEED = 220.0
@@ -31,7 +32,7 @@ SOCKET_TIMEOUT = 0.25
 
 USE_MOUSE_AIM = True
 
-# fallback se o mapa nao existir
+# fallback se nao conseguir ler o tamanho do mapa
 FALLBACK_MAP_WIDTH = 2000
 FALLBACK_MAP_HEIGHT = 2000
 
@@ -105,7 +106,6 @@ def receiver_loop():
             projectiles_list = msg.get("projectiles", [])
 
             new_players = {}
-
             if isinstance(players_list, list):
                 for p in players_list:
                     if not isinstance(p, dict):
@@ -127,6 +127,7 @@ def receiver_loop():
                 for b in projectiles_list:
                     if not isinstance(b, dict):
                         continue
+
                     new_projectiles.append({
                         "owner": str(b.get("owner", "")),
                         "x": float(b.get("x", 0.0)),
@@ -138,6 +139,7 @@ def receiver_loop():
                 remote_players = new_players
                 remote_projectiles = new_projectiles
 
+                # Sincroniza o proprio player com o estado do servidor
                 if PLAYER_NAME in remote_players:
                     server_me = remote_players[PLAYER_NAME]
                     local_player["hp"] = int(server_me.get("hp", local_player["hp"]))
@@ -288,6 +290,7 @@ def handle_input(dt):
         send_json({
             "type": "shoot",
             "name": local_player["name"],
+            "image": local_player["image"],
             "x": local_player["x"],
             "y": local_player["y"],
             "vx": dir_x * BULLET_SPEED,
@@ -356,8 +359,8 @@ def draw_fallback_map():
     tile = 64
     for y in range(0, map_height, tile):
         for x in range(0, map_width, tile):
-            c = pr.DARKGREEN if ((x // tile) + (y // tile)) % 2 == 0 else pr.GREEN
-            pr.draw_rectangle(x, y, tile, tile, c)
+            color = pr.DARKGREEN if ((x // tile) + (y // tile)) % 2 == 0 else pr.GREEN
+            pr.draw_rectangle(x, y, tile, tile, color)
 
 # ============================================================
 # MAIN
@@ -375,6 +378,7 @@ def main():
     pr.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, WINDOW_TITLE)
     pr.set_target_fps(60)
 
+    # carrega mapa uma unica vez
     map_texture = get_texture(MAP_IMAGE)
     if map_texture is not None:
         map_width = map_texture.width
@@ -382,6 +386,7 @@ def main():
 
     init_camera()
 
+    # registra no servidor
     send_update()
     last_update_sent = 0.0
 
@@ -405,26 +410,21 @@ def main():
 
         pr.begin_mode_2d(camera)
 
-        # mapa
         if map_texture is not None:
             pr.draw_texture(map_texture, 0, 0, pr.WHITE)
         else:
             draw_fallback_map()
 
-        # players remotos
         for name, player in players_snapshot.items():
             if name == PLAYER_NAME:
                 continue
             draw_player(player, is_local=False)
 
-        # projeteis
         for projectile in projectiles_snapshot:
             draw_projectile(projectile)
 
-        # player local
         draw_player(local_player, is_local=True)
 
-        # mira
         if USE_MOUSE_AIM:
             mouse_screen = pr.get_mouse_position()
             mouse_world = pr.get_screen_to_world_2d(mouse_screen, camera)
@@ -432,7 +432,6 @@ def main():
 
         pr.end_mode_2d()
 
-        # HUD
         hud = f"HP: {local_player['hp']}   X: {int(local_player['x'])}   Y: {int(local_player['y'])}"
         pr.draw_rectangle(10, 10, 320, 36, pr.fade(pr.BLACK, 0.5))
         pr.draw_text(hud, 20, 20, 20, pr.RAYWHITE)
