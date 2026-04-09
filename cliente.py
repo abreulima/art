@@ -2,9 +2,9 @@ import json
 import math
 import socket
 import time
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
-import pygame
+import pyray as rl
 
 
 # ==========================================
@@ -16,14 +16,17 @@ SERVER_ADDR = (SERVER_HOST, SERVER_PORT)
 
 SCREEN_WIDTH = 1000
 SCREEN_HEIGHT = 700
-FPS = 60
+TITLE = "Cliente UDP - Multiplayer com Projeteis"
 
 PLAYER_SPEED = 250.0
 NETWORK_INTERVAL = 0.05
 SHOOT_COOLDOWN = 0.2
 
+PLAYER_RADIUS = 18
+PROJECTILE_DEFAULT_RADIUS = 6
+
 PLAYER_NAME = "Player1"
-PLAYER_IMAGE = "players/player.png"   # mantido por compatibilidade com o servidor
+PLAYER_IMAGE = "players/player.png"  # compatibilidade com o servidor
 
 
 # ==========================================
@@ -35,6 +38,8 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
+        if isinstance(value, bool):
+            return default
         num = float(value)
         if math.isnan(num) or math.isinf(num):
             return default
@@ -43,20 +48,32 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def normalize_vector(x: float, y: float) -> tuple[float, float]:
+    length = math.hypot(x, y)
+    if length <= 0.0001:
+        return 0.0, 0.0
+    return x / length, y / length
+
+
+def send_json(sock: socket.socket, payload: Dict[str, Any]) -> None:
+    try:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sock.sendto(raw, SERVER_ADDR)
+    except Exception:
+        pass
+
+
 # ==========================================
-# Cliente
+# Cliente principal
 # ==========================================
 def main() -> None:
-    pygame.init()
-    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("Cliente UDP - Multiplayer com Projetéis")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont(None, 24)
+    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, TITLE)
+    rl.set_target_fps(60)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.001)
 
-    local_player = {
+    local_player: Dict[str, Any] = {
         "name": PLAYER_NAME,
         "image": PLAYER_IMAGE,
         "x": SCREEN_WIDTH / 2,
@@ -66,79 +83,61 @@ def main() -> None:
     world_players: List[Dict[str, Any]] = []
     world_projectiles: List[Dict[str, Any]] = []
 
-    running = True
     last_network_time = 0.0
     last_shot_time = 0.0
 
-    while running:
-        dt = clock.tick(FPS) / 1000.0
+    while not rl.window_should_close():
+        dt = rl.get_frame_time()
+        now = time.time()
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-        # ------------------------------
-        # Entrada do teclado
-        # ------------------------------
-        keys = pygame.key.get_pressed()
+        # ==========================================
+        # Movimento
+        # ==========================================
         move_x = 0.0
         move_y = 0.0
 
-        if keys[pygame.K_w]:
+        if rl.is_key_down(rl.KeyboardKey.KEY_W):
             move_y -= 1.0
-        if keys[pygame.K_s]:
+        if rl.is_key_down(rl.KeyboardKey.KEY_S):
             move_y += 1.0
-        if keys[pygame.K_a]:
+        if rl.is_key_down(rl.KeyboardKey.KEY_A):
             move_x -= 1.0
-        if keys[pygame.K_d]:
+        if rl.is_key_down(rl.KeyboardKey.KEY_D):
             move_x += 1.0
 
-        length = math.hypot(move_x, move_y)
-        if length > 0.0:
-            move_x /= length
-            move_y /= length
+        move_x, move_y = normalize_vector(move_x, move_y)
 
         local_player["x"] += move_x * PLAYER_SPEED * dt
         local_player["y"] += move_y * PLAYER_SPEED * dt
 
-        local_player["x"] = clamp(local_player["x"], 0, SCREEN_WIDTH)
-        local_player["y"] = clamp(local_player["y"], 0, SCREEN_HEIGHT)
+        local_player["x"] = clamp(local_player["x"], PLAYER_RADIUS, SCREEN_WIDTH - PLAYER_RADIUS)
+        local_player["y"] = clamp(local_player["y"], PLAYER_RADIUS, SCREEN_HEIGHT - PLAYER_RADIUS)
 
-        # ------------------------------
-        # Disparo com mouse
-        # ------------------------------
-        mouse_buttons = pygame.mouse.get_pressed()
-        mouse_pos = pygame.mouse.get_pos()
-        now = time.time()
+        # ==========================================
+        # Disparo
+        # ==========================================
+        if rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT):
+            if now - last_shot_time >= SHOOT_COOLDOWN:
+                mouse_pos = rl.get_mouse_position()
+                dx = mouse_pos.x - float(local_player["x"])
+                dy = mouse_pos.y - float(local_player["y"])
+                dx, dy = normalize_vector(dx, dy)
 
-        if mouse_buttons[0] and (now - last_shot_time >= SHOOT_COOLDOWN):
-            dx = mouse_pos[0] - local_player["x"]
-            dy = mouse_pos[1] - local_player["y"]
-            length = math.hypot(dx, dy)
+                if dx != 0.0 or dy != 0.0:
+                    shoot_payload = {
+                        "type": "shoot",
+                        "name": local_player["name"],
+                        "x": local_player["x"],
+                        "y": local_player["y"],
+                        "dx": dx,
+                        "dy": dy,
+                    }
+                    send_json(sock, shoot_payload)
+                    last_shot_time = now
 
-            if length > 0.0001:
-                shoot_payload = {
-                    "type": "shoot",
-                    "name": local_player["name"],
-                    "x": local_player["x"],
-                    "y": local_player["y"],
-                    "dx": dx / length,
-                    "dy": dy / length,
-                }
-
-                try:
-                    sock.sendto(
-                        json.dumps(shoot_payload, separators=(",", ":")).encode("utf-8"),
-                        SERVER_ADDR
-                    )
-                except Exception:
-                    pass
-
-                last_shot_time = now
-
-        # ------------------------------
-        # Envio de update
-        # ------------------------------
+        # ==========================================
+        # Update de rede
+        # ==========================================
         if now - last_network_time >= NETWORK_INTERVAL:
             update_payload = {
                 "type": "update",
@@ -147,20 +146,12 @@ def main() -> None:
                 "x": local_player["x"],
                 "y": local_player["y"],
             }
-
-            try:
-                sock.sendto(
-                    json.dumps(update_payload, separators=(",", ":")).encode("utf-8"),
-                    SERVER_ADDR
-                )
-            except Exception:
-                pass
-
+            send_json(sock, update_payload)
             last_network_time = now
 
-        # ------------------------------
-        # Recebimento de respostas do servidor
-        # ------------------------------
+        # ==========================================
+        # Recebimento do estado do mundo
+        # ==========================================
         while True:
             try:
                 raw_data, _addr = sock.recvfrom(65535)
@@ -189,17 +180,18 @@ def main() -> None:
                 if isinstance(projectiles_data, list):
                     world_projectiles = projectiles_data
 
-        # ------------------------------
+        # ==========================================
         # Render
-        # ------------------------------
-        screen.fill((30, 30, 40))
+        # ==========================================
+        rl.begin_drawing()
+        rl.clear_background(rl.Color(30, 30, 40, 255))
 
         # projéteis
         for projectile in world_projectiles:
             px = int(safe_float(projectile.get("x"), 0.0))
             py = int(safe_float(projectile.get("y"), 0.0))
-            radius = int(safe_float(projectile.get("radius"), 6.0))
-            pygame.draw.circle(screen, (255, 220, 80), (px, py), radius)
+            radius = int(safe_float(projectile.get("radius"), PROJECTILE_DEFAULT_RADIUS))
+            rl.draw_circle(px, py, float(radius), rl.GOLD)
 
         # jogadores
         for player in world_players:
@@ -207,23 +199,21 @@ def main() -> None:
             x = int(safe_float(player.get("x"), 0.0))
             y = int(safe_float(player.get("y"), 0.0))
 
-            color = (80, 200, 255)
+            color = rl.SKYBLUE
             if name == local_player["name"]:
-                color = (80, 255, 120)
+                color = rl.LIME
 
-            pygame.draw.circle(screen, color, (x, y), 18)
+            rl.draw_circle(x, y, float(PLAYER_RADIUS), color)
+            rl.draw_text(name, x - 30, y - 35, 20, rl.WHITE)
 
-            text_surface = font.render(name, True, (255, 255, 255))
-            text_rect = text_surface.get_rect(center=(x, y - 28))
-            screen.blit(text_surface, text_rect)
+        rl.draw_text("WASD move | Botao esquerdo atira", 10, 10, 20, rl.RAYWHITE)
+        rl.draw_text(f"Jogador: {PLAYER_NAME}", 10, 35, 20, rl.RAYWHITE)
+        rl.draw_fps(SCREEN_WIDTH - 95, 10)
 
-        info = font.render("WASD move | Clique esquerdo atira", True, (220, 220, 220))
-        screen.blit(info, (10, 10))
-
-        pygame.display.flip()
+        rl.end_drawing()
 
     sock.close()
-    pygame.quit()
+    rl.close_window()
 
 
 if __name__ == "__main__":
