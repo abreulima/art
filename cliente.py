@@ -1,220 +1,406 @@
 import json
 import math
+import os
 import socket
+import threading
 import time
-from typing import Any, Dict, List
+import pyray as pr
 
-import pyray as rl
+# ============================================================
+# CONFIG
+# ============================================================
 
-
-# ==========================================
-# Configuração
-# ==========================================
-SERVER_HOST = "192.168.1.81"
+SERVER_IP = "192.168.1.81"
 SERVER_PORT = 5550
-SERVER_ADDR = (SERVER_HOST, SERVER_PORT)
+SERVER_ADDR = (SERVER_IP, SERVER_PORT)
 
-SCREEN_WIDTH = 1000
-SCREEN_HEIGHT = 700
-TITLE = "Cliente UDP - Multiplayer com Projeteis"
+SCREEN_WIDTH = 1280
+SCREEN_HEIGHT = 720
+WINDOW_TITLE = "PvP UDP Client - pyray"
 
-PLAYER_SPEED = 250.0
-NETWORK_INTERVAL = 0.05
-SHOOT_COOLDOWN = 0.2
+PLAYER_NAME = "player"
+PLAYER_IMAGE = "players/player.png"
+MAP_IMAGE = "map.png"
 
-PLAYER_RADIUS = 18
-PROJECTILE_DEFAULT_RADIUS = 6
+MOVE_SPEED = 220.0
+BULLET_SPEED = 520.0
+SHOOT_COOLDOWN = 0.18
+MAX_HP = 100
+UPDATE_INTERVAL = 1.0 / 30.0
+SOCKET_TIMEOUT = 0.25
 
-PLAYER_NAME = "Player1"
-PLAYER_IMAGE = "players/player.png"  # compatibilidade com o servidor
+# Pode trocar a tecla de tiro se quiser.
+# Aqui: seta para direção do tiro, ou mouse para mirar + clique esquerdo.
+USE_MOUSE_AIM = True
 
+# ============================================================
+# ESTADO GLOBAL
+# ============================================================
 
-# ==========================================
-# Utilidades
-# ==========================================
-def clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(value, max_value))
+running = True
 
+world_lock = threading.Lock()
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+# Estado recebido do servidor
+remote_players = {}      # name -> dict
+remote_projectiles = []  # lista de projéteis
+
+# Estado local
+local_player = {
+    "name": PLAYER_NAME,
+    "image": PLAYER_IMAGE,
+    "x": 400.0,
+    "y": 300.0,
+    "hp": MAX_HP,
+    "dir_x": 1.0,
+    "dir_y": 0.0,
+    "w": 32,
+    "h": 32,
+}
+
+# Cache de texturas por caminho
+texture_cache = {}
+
+# Controle de tiro local
+last_shot_time = 0.0
+
+# UDP
+sock = None
+
+# ============================================================
+# UDP / THREAD DE RECEBIMENTO
+# ============================================================
+
+def send_json(data: dict):
+    global sock
     try:
-        if isinstance(value, bool):
-            return default
-        num = float(value)
-        if math.isnan(num) or math.isinf(num):
-            return default
-        return num
-    except Exception:
-        return default
-
-
-def normalize_vector(x: float, y: float) -> tuple[float, float]:
-    length = math.hypot(x, y)
-    if length <= 0.0001:
-        return 0.0, 0.0
-    return x / length, y / length
-
-
-def send_json(sock: socket.socket, payload: Dict[str, Any]) -> None:
-    try:
-        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        sock.sendto(raw, SERVER_ADDR)
+        payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        sock.sendto(payload, SERVER_ADDR)
     except Exception:
         pass
 
+def receiver_loop():
+    global running, remote_players, remote_projectiles, local_player
 
-# ==========================================
-# Cliente principal
-# ==========================================
-def main() -> None:
-    rl.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, TITLE)
-    rl.set_target_fps(60)
+    while running:
+        try:
+            data, _addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        except Exception:
+            continue
+
+        try:
+            msg = json.loads(data.decode("utf-8"))
+        except Exception:
+            continue
+
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("type") == "world":
+            players_list = msg.get("players", [])
+            projectiles_list = msg.get("projectiles", [])
+
+            new_players = {}
+
+            if isinstance(players_list, list):
+                for p in players_list:
+                    if not isinstance(p, dict):
+                        continue
+
+                    name = str(p.get("name", "unknown"))
+                    new_players[name] = {
+                        "name": name,
+                        "image": str(p.get("image", "players/player.png")),
+                        "x": float(p.get("x", 0.0)),
+                        "y": float(p.get("y", 0.0)),
+                        "hp": int(p.get("hp", MAX_HP)),
+                        "w": int(p.get("w", 32)),
+                        "h": int(p.get("h", 32)),
+                    }
+
+            new_projectiles = []
+            if isinstance(projectiles_list, list):
+                for b in projectiles_list:
+                    if not isinstance(b, dict):
+                        continue
+                    new_projectiles.append({
+                        "owner": str(b.get("owner", "")),
+                        "x": float(b.get("x", 0.0)),
+                        "y": float(b.get("y", 0.0)),
+                        "radius": float(b.get("radius", 5.0)),
+                    })
+
+            with world_lock:
+                remote_players = new_players
+                remote_projectiles = new_projectiles
+
+                # Se o servidor enviar o próprio player, sincroniza HP/posição.
+                if PLAYER_NAME in remote_players:
+                    server_me = remote_players[PLAYER_NAME]
+                    local_player["hp"] = int(server_me.get("hp", local_player["hp"]))
+                    local_player["x"] = float(server_me.get("x", local_player["x"]))
+                    local_player["y"] = float(server_me.get("y", local_player["y"]))
+
+# ============================================================
+# RECURSOS
+# ============================================================
+
+def get_texture(path: str):
+    if path in texture_cache:
+        return texture_cache[path]
+
+    if os.path.exists(path):
+        try:
+            tex = pr.load_texture(path)
+            texture_cache[path] = tex
+            return tex
+        except Exception:
+            pass
+
+    texture_cache[path] = None
+    return None
+
+def unload_all_textures():
+    for tex in texture_cache.values():
+        if tex is not None:
+            try:
+                pr.unload_texture(tex)
+            except Exception:
+                pass
+    texture_cache.clear()
+
+# ============================================================
+# LÓGICA
+# ============================================================
+
+def normalize(x, y):
+    length = math.hypot(x, y)
+    if length <= 0.00001:
+        return 0.0, 0.0
+    return x / length, y / length
+
+def handle_input(dt):
+    global last_shot_time
+
+    move_x = 0.0
+    move_y = 0.0
+
+    if pr.is_key_down(pr.KEY_W):
+        move_y -= 1.0
+    if pr.is_key_down(pr.KEY_S):
+        move_y += 1.0
+    if pr.is_key_down(pr.KEY_A):
+        move_x -= 1.0
+    if pr.is_key_down(pr.KEY_D):
+        move_x += 1.0
+
+    move_x, move_y = normalize(move_x, move_y)
+
+    local_player["x"] += move_x * MOVE_SPEED * dt
+    local_player["y"] += move_y * MOVE_SPEED * dt
+
+    if move_x != 0.0 or move_y != 0.0:
+        local_player["dir_x"] = move_x
+        local_player["dir_y"] = move_y
+
+    shoot_dx, shoot_dy = 0.0, 0.0
+
+    if USE_MOUSE_AIM:
+        mouse = pr.get_mouse_position()
+        shoot_dx = mouse.x - local_player["x"]
+        shoot_dy = mouse.y - local_player["y"]
+        shoot_dx, shoot_dy = normalize(shoot_dx, shoot_dy)
+
+        if shoot_dx != 0.0 or shoot_dy != 0.0:
+            local_player["dir_x"] = shoot_dx
+            local_player["dir_y"] = shoot_dy
+
+        want_shoot = pr.is_mouse_button_down(pr.MOUSE_BUTTON_LEFT)
+    else:
+        if pr.is_key_down(pr.KEY_UP):
+            shoot_dy -= 1.0
+        if pr.is_key_down(pr.KEY_DOWN):
+            shoot_dy += 1.0
+        if pr.is_key_down(pr.KEY_LEFT):
+            shoot_dx -= 1.0
+        if pr.is_key_down(pr.KEY_RIGHT):
+            shoot_dx += 1.0
+
+        shoot_dx, shoot_dy = normalize(shoot_dx, shoot_dy)
+        want_shoot = (shoot_dx != 0.0 or shoot_dy != 0.0)
+
+        if want_shoot:
+            local_player["dir_x"] = shoot_dx
+            local_player["dir_y"] = shoot_dy
+
+    now = time.time()
+    if want_shoot and (now - last_shot_time) >= SHOOT_COOLDOWN:
+        dir_x = local_player["dir_x"]
+        dir_y = local_player["dir_y"]
+
+        if dir_x == 0.0 and dir_y == 0.0:
+            dir_x, dir_y = 1.0, 0.0
+
+        send_json({
+            "type": "shoot",
+            "name": local_player["name"],
+            "x": local_player["x"],
+            "y": local_player["y"],
+            "vx": dir_x * BULLET_SPEED,
+            "vy": dir_y * BULLET_SPEED,
+            "radius": 5,
+            "damage": 10,
+        })
+        last_shot_time = now
+
+def send_update():
+    send_json({
+        "type": "update",
+        "name": local_player["name"],
+        "image": local_player["image"],
+        "x": local_player["x"],
+        "y": local_player["y"],
+        "hp": local_player["hp"],
+    })
+
+# ============================================================
+# RENDER
+# ============================================================
+
+def draw_texture_centered(tex, x, y):
+    if tex is None:
+        pr.draw_rectangle(int(x - 16), int(y - 16), 32, 32, pr.BLUE)
+        return
+
+    pr.draw_texture(tex, int(x - tex.width / 2), int(y - tex.height / 2), pr.WHITE)
+
+def draw_hp_bar(x, y, hp, width=48, height=6):
+    hp = max(0, min(MAX_HP, hp))
+    filled = int((hp / MAX_HP) * width)
+
+    pr.draw_rectangle(int(x - width // 2), int(y), width, height, pr.DARKGRAY)
+    pr.draw_rectangle(int(x - width // 2), int(y), filled, height, pr.RED)
+    pr.draw_rectangle_lines(int(x - width // 2), int(y), width, height, pr.BLACK)
+
+def draw_player(player, is_local=False):
+    tex = get_texture(player.get("image", PLAYER_IMAGE))
+
+    x = float(player.get("x", 0))
+    y = float(player.get("y", 0))
+    hp = int(player.get("hp", MAX_HP))
+    name = str(player.get("name", "unknown"))
+
+    draw_texture_centered(tex, x, y)
+    draw_hp_bar(x, y - 34, hp)
+
+    color = pr.YELLOW if is_local else pr.WHITE
+    font_size = 18
+    text_w = pr.measure_text(name, font_size)
+    pr.draw_text(name, int(x - text_w / 2), int(y - 56), font_size, color)
+
+def draw_projectile(projectile):
+    x = float(projectile.get("x", 0))
+    y = float(projectile.get("y", 0))
+    r = float(projectile.get("radius", 5))
+    owner = str(projectile.get("owner", ""))
+
+    color = pr.ORANGE if owner == PLAYER_NAME else pr.MAROON
+    pr.draw_circle(int(x), int(y), r, color)
+
+def draw_fallback_map():
+    tile = 64
+    for y in range(0, SCREEN_HEIGHT, tile):
+        for x in range(0, SCREEN_WIDTH, tile):
+            c = pr.DARKGREEN if ((x // tile) + (y // tile)) % 2 == 0 else pr.GREEN
+            pr.draw_rectangle(x, y, tile, tile, c)
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    global sock, running
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.001)
+    sock.settimeout(SOCKET_TIMEOUT)
 
-    local_player: Dict[str, Any] = {
-        "name": PLAYER_NAME,
-        "image": PLAYER_IMAGE,
-        "x": SCREEN_WIDTH / 2,
-        "y": SCREEN_HEIGHT / 2,
-    }
+    recv_thread = threading.Thread(target=receiver_loop, daemon=True)
+    recv_thread.start()
 
-    world_players: List[Dict[str, Any]] = []
-    world_projectiles: List[Dict[str, Any]] = []
+    pr.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, WINDOW_TITLE)
+    pr.set_target_fps(60)
 
-    last_network_time = 0.0
-    last_shot_time = 0.0
+    # Carrega o mapa UMA única vez
+    map_texture = get_texture(MAP_IMAGE)
 
-    while not rl.window_should_close():
-        dt = rl.get_frame_time()
+    # Envia presença inicial
+    send_update()
+
+    last_update_sent = 0.0
+
+    while not pr.window_should_close():
+        dt = pr.get_frame_time()
+
+        handle_input(dt)
+
         now = time.time()
+        if (now - last_update_sent) >= UPDATE_INTERVAL:
+            send_update()
+            last_update_sent = now
 
-        # ==========================================
-        # Movimento
-        # ==========================================
-        move_x = 0.0
-        move_y = 0.0
+        with world_lock:
+            players_snapshot = dict(remote_players)
+            projectiles_snapshot = list(remote_projectiles)
 
-        if rl.is_key_down(rl.KeyboardKey.KEY_W):
-            move_y -= 1.0
-        if rl.is_key_down(rl.KeyboardKey.KEY_S):
-            move_y += 1.0
-        if rl.is_key_down(rl.KeyboardKey.KEY_A):
-            move_x -= 1.0
-        if rl.is_key_down(rl.KeyboardKey.KEY_D):
-            move_x += 1.0
+        pr.begin_drawing()
+        pr.clear_background(pr.BLACK)
 
-        move_x, move_y = normalize_vector(move_x, move_y)
+        # Fundo / mapa
+        if map_texture is not None:
+            pr.draw_texture(map_texture, 0, 0, pr.WHITE)
+        else:
+            draw_fallback_map()
 
-        local_player["x"] += move_x * PLAYER_SPEED * dt
-        local_player["y"] += move_y * PLAYER_SPEED * dt
-
-        local_player["x"] = clamp(local_player["x"], PLAYER_RADIUS, SCREEN_WIDTH - PLAYER_RADIUS)
-        local_player["y"] = clamp(local_player["y"], PLAYER_RADIUS, SCREEN_HEIGHT - PLAYER_RADIUS)
-
-        # ==========================================
-        # Disparo
-        # ==========================================
-        if rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT):
-            if now - last_shot_time >= SHOOT_COOLDOWN:
-                mouse_pos = rl.get_mouse_position()
-                dx = mouse_pos.x - float(local_player["x"])
-                dy = mouse_pos.y - float(local_player["y"])
-                dx, dy = normalize_vector(dx, dy)
-
-                if dx != 0.0 or dy != 0.0:
-                    shoot_payload = {
-                        "type": "shoot",
-                        "name": local_player["name"],
-                        "x": local_player["x"],
-                        "y": local_player["y"],
-                        "dx": dx,
-                        "dy": dy,
-                    }
-                    send_json(sock, shoot_payload)
-                    last_shot_time = now
-
-        # ==========================================
-        # Update de rede
-        # ==========================================
-        if now - last_network_time >= NETWORK_INTERVAL:
-            update_payload = {
-                "type": "update",
-                "name": local_player["name"],
-                "image": local_player["image"],
-                "x": local_player["x"],
-                "y": local_player["y"],
-            }
-            send_json(sock, update_payload)
-            last_network_time = now
-
-        # ==========================================
-        # Recebimento do estado do mundo
-        # ==========================================
-        while True:
-            try:
-                raw_data, _addr = sock.recvfrom(65535)
-            except socket.timeout:
-                break
-            except BlockingIOError:
-                break
-            except Exception:
-                break
-
-            try:
-                message = json.loads(raw_data.decode("utf-8"))
-            except Exception:
+        # Jogadores remotos
+        for name, player in players_snapshot.items():
+            if name == PLAYER_NAME:
                 continue
+            draw_player(player, is_local=False)
 
-            if not isinstance(message, dict):
-                continue
+        # Projetéis
+        for projectile in projectiles_snapshot:
+            draw_projectile(projectile)
 
-            if message.get("type") == "world":
-                players_data = message.get("players", [])
-                projectiles_data = message.get("projectiles", [])
+        # Jogador local por cima
+        draw_player(local_player, is_local=True)
 
-                if isinstance(players_data, list):
-                    world_players = players_data
+        # HUD
+        hud = f"HP: {local_player['hp']}   X: {int(local_player['x'])}   Y: {int(local_player['y'])}"
+        pr.draw_rectangle(10, 10, 320, 36, pr.fade(pr.BLACK, 0.5))
+        pr.draw_text(hud, 20, 20, 20, pr.RAYWHITE)
 
-                if isinstance(projectiles_data, list):
-                    world_projectiles = projectiles_data
+        controls = "Mover: W A S D | Atirar: Mouse Esq"
+        if not USE_MOUSE_AIM:
+            controls = "Mover: W A S D | Atirar: Setas"
 
-        # ==========================================
-        # Render
-        # ==========================================
-        rl.begin_drawing()
-        rl.clear_background(rl.Color(30, 30, 40, 255))
+        pr.draw_rectangle(10, SCREEN_HEIGHT - 36, 360, 26, pr.fade(pr.BLACK, 0.45))
+        pr.draw_text(controls, 20, SCREEN_HEIGHT - 30, 18, pr.RAYWHITE)
 
-        # projéteis
-        for projectile in world_projectiles:
-            px = int(safe_float(projectile.get("x"), 0.0))
-            py = int(safe_float(projectile.get("y"), 0.0))
-            radius = int(safe_float(projectile.get("radius"), PROJECTILE_DEFAULT_RADIUS))
-            rl.draw_circle(px, py, float(radius), rl.GOLD)
+        pr.end_drawing()
 
-        # jogadores
-        for player in world_players:
-            name = str(player.get("name", ""))
-            x = int(safe_float(player.get("x"), 0.0))
-            y = int(safe_float(player.get("y"), 0.0))
+    running = False
 
-            color = rl.SKYBLUE
-            if name == local_player["name"]:
-                color = rl.LIME
+    try:
+        sock.close()
+    except Exception:
+        pass
 
-            rl.draw_circle(x, y, float(PLAYER_RADIUS), color)
-            rl.draw_text(name, x - 30, y - 35, 20, rl.WHITE)
-
-        rl.draw_text("WASD move | Botao esquerdo atira", 10, 10, 20, rl.RAYWHITE)
-        rl.draw_text(f"Jogador: {PLAYER_NAME}", 10, 35, 20, rl.RAYWHITE)
-        rl.draw_fps(SCREEN_WIDTH - 95, 10)
-
-        rl.end_drawing()
-
-    sock.close()
-    rl.close_window()
-
+    unload_all_textures()
+    pr.close_window()
 
 if __name__ == "__main__":
     main()
