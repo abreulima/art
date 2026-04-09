@@ -14,11 +14,8 @@ SERVER_IP = "192.168.1.81"
 SERVER_PORT = 5550
 SERVER_ADDR = (SERVER_IP, SERVER_PORT)
 
-SCREEN_WIDTH = 1280
-SCREEN_HEIGHT = 720
 WINDOW_TITLE = "PvP UDP Client - pyray"
 
-# IMPORTANTE: cada cliente deve ter um nome diferente
 PLAYER_NAME = "player1"
 PLAYER_IMAGE = "players/player.png"
 MAP_IMAGE = "map.png"
@@ -31,8 +28,8 @@ UPDATE_INTERVAL = 1.0 / 30.0
 SOCKET_TIMEOUT = 0.25
 
 USE_MOUSE_AIM = True
+START_FULLSCREEN = True
 
-# fallback se nao conseguir ler o tamanho do mapa
 FALLBACK_MAP_WIDTH = 2000
 FALLBACK_MAP_HEIGHT = 2000
 
@@ -42,6 +39,7 @@ FALLBACK_MAP_HEIGHT = 2000
 
 running = True
 world_lock = threading.Lock()
+local_lock = threading.Lock()
 
 remote_players = {}
 remote_projectiles = []
@@ -67,6 +65,8 @@ map_width = FALLBACK_MAP_WIDTH
 map_height = FALLBACK_MAP_HEIGHT
 
 camera = None
+SCREEN_WIDTH = 1280
+SCREEN_HEIGHT = 720
 
 # ============================================================
 # UDP / THREAD DE RECEBIMENTO
@@ -74,14 +74,19 @@ camera = None
 
 def send_json(data: dict):
     global sock
+    if sock is None:
+        return
+
     try:
         payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
         sock.sendto(payload, SERVER_ADDR)
-    except Exception:
-        pass
+    except OSError as e:
+        print("Erro de socket ao enviar:", e)
+    except Exception as e:
+        print("Erro ao enviar JSON:", e)
 
 def receiver_loop():
-    global running, remote_players, remote_projectiles, local_player
+    global running, remote_players, remote_projectiles
 
     while running:
         try:
@@ -90,7 +95,8 @@ def receiver_loop():
             continue
         except OSError:
             break
-        except Exception:
+        except Exception as e:
+            print("Erro no recv:", e)
             continue
 
         try:
@@ -111,7 +117,7 @@ def receiver_loop():
                     if not isinstance(p, dict):
                         continue
 
-                    name = str(p.get("name", "unknown"))
+                    name = str(p.get("name", "unknown"))[:24]
                     new_players[name] = {
                         "name": name,
                         "image": str(p.get("image", "players/player.png")),
@@ -139,9 +145,9 @@ def receiver_loop():
                 remote_players = new_players
                 remote_projectiles = new_projectiles
 
-                # Sincroniza o proprio player com o estado do servidor
-                if PLAYER_NAME in remote_players:
-                    server_me = remote_players[PLAYER_NAME]
+            if PLAYER_NAME in new_players:
+                server_me = new_players[PLAYER_NAME]
+                with local_lock:
                     local_player["hp"] = int(server_me.get("hp", local_player["hp"]))
                     local_player["x"] = float(server_me.get("x", local_player["x"]))
                     local_player["y"] = float(server_me.get("y", local_player["y"]))
@@ -159,8 +165,8 @@ def get_texture(path: str):
             tex = pr.load_texture(path)
             texture_cache[path] = tex
             return tex
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Erro ao carregar textura {path}: {e}")
 
     texture_cache[path] = None
     return None
@@ -194,13 +200,18 @@ def clamp(v, min_v, max_v):
 def init_camera():
     global camera
     camera = pr.Camera2D()
-    camera.target = pr.Vector2(local_player["x"], local_player["y"])
+    with local_lock:
+        px = local_player["x"]
+        py = local_player["y"]
+    camera.target = pr.Vector2(px, py)
     camera.offset = pr.Vector2(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
     camera.rotation = 0.0
     camera.zoom = 1.0
 
 def update_camera():
-    camera.target = pr.Vector2(local_player["x"], local_player["y"])
+    with local_lock:
+        px = local_player["x"]
+        py = local_player["y"]
 
     half_w = SCREEN_WIDTH / 2 / camera.zoom
     half_h = SCREEN_HEIGHT / 2 / camera.zoom
@@ -211,10 +222,11 @@ def update_camera():
     min_y = half_h
     max_y = max(half_h, map_height - half_h)
 
-    target_x = clamp(local_player["x"], min_x, max_x)
-    target_y = clamp(local_player["y"], min_y, max_y)
+    target_x = clamp(px, min_x, max_x)
+    target_y = clamp(py, min_y, max_y)
 
     camera.target = pr.Vector2(target_x, target_y)
+    camera.offset = pr.Vector2(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
 
 # ============================================================
 # LOGICA
@@ -237,15 +249,16 @@ def handle_input(dt):
 
     move_x, move_y = normalize(move_x, move_y)
 
-    local_player["x"] += move_x * MOVE_SPEED * dt
-    local_player["y"] += move_y * MOVE_SPEED * dt
+    with local_lock:
+        local_player["x"] += move_x * MOVE_SPEED * dt
+        local_player["y"] += move_y * MOVE_SPEED * dt
 
-    local_player["x"] = clamp(local_player["x"], 0, map_width)
-    local_player["y"] = clamp(local_player["y"], 0, map_height)
+        local_player["x"] = clamp(local_player["x"], 0, map_width)
+        local_player["y"] = clamp(local_player["y"], 0, map_height)
 
-    if move_x != 0.0 or move_y != 0.0:
-        local_player["dir_x"] = move_x
-        local_player["dir_y"] = move_y
+        if move_x != 0.0 or move_y != 0.0:
+            local_player["dir_x"] = move_x
+            local_player["dir_y"] = move_y
 
     shoot_dx, shoot_dy = 0.0, 0.0
 
@@ -253,13 +266,18 @@ def handle_input(dt):
         mouse_screen = pr.get_mouse_position()
         mouse_world = pr.get_screen_to_world_2d(mouse_screen, camera)
 
-        shoot_dx = mouse_world.x - local_player["x"]
-        shoot_dy = mouse_world.y - local_player["y"]
+        with local_lock:
+            px = local_player["x"]
+            py = local_player["y"]
+
+        shoot_dx = mouse_world.x - px
+        shoot_dy = mouse_world.y - py
         shoot_dx, shoot_dy = normalize(shoot_dx, shoot_dy)
 
-        if shoot_dx != 0.0 or shoot_dy != 0.0:
-            local_player["dir_x"] = shoot_dx
-            local_player["dir_y"] = shoot_dy
+        with local_lock:
+            if shoot_dx != 0.0 or shoot_dy != 0.0:
+                local_player["dir_x"] = shoot_dx
+                local_player["dir_y"] = shoot_dy
 
         want_shoot = pr.is_mouse_button_down(pr.MOUSE_BUTTON_LEFT)
     else:
@@ -275,24 +293,30 @@ def handle_input(dt):
         shoot_dx, shoot_dy = normalize(shoot_dx, shoot_dy)
         want_shoot = (shoot_dx != 0.0 or shoot_dy != 0.0)
 
-        if want_shoot:
-            local_player["dir_x"] = shoot_dx
-            local_player["dir_y"] = shoot_dy
+        with local_lock:
+            if want_shoot:
+                local_player["dir_x"] = shoot_dx
+                local_player["dir_y"] = shoot_dy
 
     now = time.time()
     if want_shoot and (now - last_shot_time) >= SHOOT_COOLDOWN:
-        dir_x = local_player["dir_x"]
-        dir_y = local_player["dir_y"]
+        with local_lock:
+            dir_x = local_player["dir_x"]
+            dir_y = local_player["dir_y"]
+            px = local_player["x"]
+            py = local_player["y"]
+            pname = local_player["name"]
+            pimage = local_player["image"]
 
         if dir_x == 0.0 and dir_y == 0.0:
             dir_x, dir_y = 1.0, 0.0
 
         send_json({
             "type": "shoot",
-            "name": local_player["name"],
-            "image": local_player["image"],
-            "x": local_player["x"],
-            "y": local_player["y"],
+            "name": pname,
+            "image": pimage,
+            "x": px,
+            "y": py,
             "vx": dir_x * BULLET_SPEED,
             "vy": dir_y * BULLET_SPEED,
             "radius": 5,
@@ -302,14 +326,16 @@ def handle_input(dt):
         last_shot_time = now
 
 def send_update():
-    send_json({
-        "type": "update",
-        "name": local_player["name"],
-        "image": local_player["image"],
-        "x": local_player["x"],
-        "y": local_player["y"],
-        "hp": local_player["hp"],
-    })
+    with local_lock:
+        payload = {
+            "type": "update",
+            "name": local_player["name"],
+            "image": local_player["image"],
+            "x": local_player["x"],
+            "y": local_player["y"],
+            "hp": local_player["hp"],
+        }
+    send_json(payload)
 
 # ============================================================
 # RENDER
@@ -357,8 +383,8 @@ def draw_projectile(projectile):
 
 def draw_fallback_map():
     tile = 64
-    for y in range(0, map_height, tile):
-        for x in range(0, map_width, tile):
+    for y in range(0, int(map_height), tile):
+        for x in range(0, int(map_width), tile):
             color = pr.DARKGREEN if ((x // tile) + (y // tile)) % 2 == 0 else pr.GREEN
             pr.draw_rectangle(x, y, tile, tile, color)
 
@@ -367,18 +393,25 @@ def draw_fallback_map():
 # ============================================================
 
 def main():
-    global sock, running, map_texture, map_width, map_height
+    global sock, running, map_texture, map_width, map_height, SCREEN_WIDTH, SCREEN_HEIGHT
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(SOCKET_TIMEOUT)
 
-    recv_thread = threading.Thread(target=receiver_loop, daemon=True)
-    recv_thread.start()
-
     pr.init_window(SCREEN_WIDTH, SCREEN_HEIGHT, WINDOW_TITLE)
+
+    if START_FULLSCREEN:
+        monitor_w = pr.get_monitor_width(pr.get_current_monitor())
+        monitor_h = pr.get_monitor_height(pr.get_current_monitor())
+        SCREEN_WIDTH = monitor_w
+        SCREEN_HEIGHT = monitor_h
+        pr.toggle_fullscreen()
+    else:
+        SCREEN_WIDTH = pr.get_screen_width()
+        SCREEN_HEIGHT = pr.get_screen_height()
+
     pr.set_target_fps(60)
 
-    # carrega mapa uma unica vez
     map_texture = get_texture(MAP_IMAGE)
     if map_texture is not None:
         map_width = map_texture.width
@@ -386,11 +419,18 @@ def main():
 
     init_camera()
 
-    # registra no servidor
+    recv_thread = threading.Thread(target=receiver_loop, daemon=True)
+    recv_thread.start()
+
     send_update()
     last_update_sent = 0.0
 
     while not pr.window_should_close():
+        if pr.is_key_pressed(pr.KEY_F11):
+            pr.toggle_fullscreen()
+            SCREEN_WIDTH = pr.get_screen_width()
+            SCREEN_HEIGHT = pr.get_screen_height()
+
         dt = pr.get_frame_time()
 
         handle_input(dt)
@@ -404,6 +444,9 @@ def main():
         with world_lock:
             players_snapshot = dict(remote_players)
             projectiles_snapshot = list(remote_projectiles)
+
+        with local_lock:
+            local_snapshot = dict(local_player)
 
         pr.begin_drawing()
         pr.clear_background(pr.BLACK)
@@ -423,7 +466,7 @@ def main():
         for projectile in projectiles_snapshot:
             draw_projectile(projectile)
 
-        draw_player(local_player, is_local=True)
+        draw_player(local_snapshot, is_local=True)
 
         if USE_MOUSE_AIM:
             mouse_screen = pr.get_mouse_position()
@@ -432,15 +475,15 @@ def main():
 
         pr.end_mode_2d()
 
-        hud = f"HP: {local_player['hp']}   X: {int(local_player['x'])}   Y: {int(local_player['y'])}"
+        hud = f"HP: {local_snapshot['hp']}   X: {int(local_snapshot['x'])}   Y: {int(local_snapshot['y'])}"
         pr.draw_rectangle(10, 10, 320, 36, pr.fade(pr.BLACK, 0.5))
         pr.draw_text(hud, 20, 20, 20, pr.RAYWHITE)
 
-        controls = "Mover: W A S D | Atirar: Mouse Esq"
+        controls = "Mover: W A S D | Atirar: Mouse Esq | F11 Fullscreen"
         if not USE_MOUSE_AIM:
-            controls = "Mover: W A S D | Atirar: Setas"
+            controls = "Mover: W A S D | Atirar: Setas | F11 Fullscreen"
 
-        pr.draw_rectangle(10, SCREEN_HEIGHT - 36, 360, 26, pr.fade(pr.BLACK, 0.45))
+        pr.draw_rectangle(10, SCREEN_HEIGHT - 36, 430, 26, pr.fade(pr.BLACK, 0.45))
         pr.draw_text(controls, 20, SCREEN_HEIGHT - 30, 18, pr.RAYWHITE)
 
         pr.end_drawing()
