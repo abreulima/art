@@ -1,6 +1,6 @@
 Crie um cliente completo em **Python** usando **pyray (Raylib)**.
 
-* Conectar via **UDP** em `192.168.1.81:5050`
+* Conectar via **UDP** em `192.168.1.81:5550`
 * Enviar continuamente:
 
 ```json
